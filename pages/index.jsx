@@ -287,13 +287,22 @@ export default function App() {
     { title:"Demo – Desert Bloom Spa", date:"2026-06-10", time:"2:30 PM", with:"Monica Reyes", email:"monica@desertbloomspa.com", notes:"Interested in appointment booking automation" },
   ]);
 
-  // ── Email Sender Config ──
-  const [emailConfig, setEmailConfig] = useState({
-    serviceId: "", templateId: "", publicKey: "",
-    fromName: "Hunain | Navain AI", configured: false
+  // ── Email Sender Config (persisted to localStorage) ──
+  const [emailConfig, setEmailConfig] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_emailjs_config");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return { serviceId: "", templateId: "", publicKey: "", fromName: "Hunain | Navain AI", configured: false };
   });
   const [showConfig, setShowConfig] = useState(false);
-  const [configDraft, setConfigDraft] = useState({ serviceId:"", templateId:"", publicKey:"", fromName:"Hunain | Navain AI" });
+  const [configDraft, setConfigDraft] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_emailjs_config");
+      if (saved) { const p = JSON.parse(saved); return { serviceId:p.serviceId||"", templateId:p.templateId||"", publicKey:p.publicKey||"", fromName:p.fromName||"Hunain | Navain AI" }; }
+    } catch(e) {}
+    return { serviceId:"", templateId:"", publicKey:"", fromName:"Hunain | Navain AI" };
+  });
 
   // ── Email Queue & Sending ──
   const [sendQueue, setSendQueue] = useState([]);
@@ -712,9 +721,11 @@ export default function App() {
                   <div style={{ display:"flex", gap:10 }}>
                     <button onClick={()=>{
                       if(!configDraft.serviceId||!configDraft.templateId||!configDraft.publicKey) { addToast("Fill all fields","warn"); return; }
-                      setEmailConfig({...configDraft, configured:true});
+                      const cfg = {...configDraft, configured:true};
+                      setEmailConfig(cfg);
+                      try { localStorage.setItem("navain_emailjs_config", JSON.stringify(cfg)); } catch(e) {}
                       setShowConfig(false);
-                      addToast("EmailJS configured! Ready to send.");
+                      addToast("EmailJS saved permanently ✓");
                     }} style={pBtn(false)}>Save Configuration</button>
                     <button onClick={()=>setShowConfig(false)} style={secBtn}>Cancel</button>
                   </div>
@@ -875,4 +886,3 @@ export default function App() {
     </div>
   );
 }
-
