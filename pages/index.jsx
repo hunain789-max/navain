@@ -56,7 +56,7 @@ const STATUS_COLORS = {
   "Meeting Set":"#10b981", Closed:"#6b7280", Bounced:"#ef4444"
 };
 
-const TABS = ["Dashboard","Leads","Email Sender","Campaigns","Calendar","Agent Chat"];
+const TABS = ["Dashboard","Leads","Email Sender","Campaigns","Calendar","Email Log","Agent Chat"];
 
 // ─── Claude API — calls Vercel proxy ─────────────────────────────────────────
 async function claude({ system, messages, max_tokens = 1500 }) {
@@ -271,13 +271,20 @@ export default function App() {
     setToasts(p => [...p, { id, msg, type }]);
   }, []);
 
-  // ── Leads ──
-  const [leads, setLeads] = useState([
+  // ── Leads (persistent) ──
+  const SAMPLE_LEADS = [
     { name:"Mountain View Dental", owner:"Dr. Rachel Kim", email:"rachel@mountainviewdental.com", phone:"801-555-0112", city:"Salt Lake City", state:"UT", niche:"Dental Offices", status:"New", _source:"Claude AI", _addedAt:Date.now()-86400000 },
     { name:"Desert Bloom Spa", owner:"Monica Reyes", email:"monica@desertbloomspa.com", phone:"602-555-0247", city:"Phoenix", state:"AZ", niche:"Spas", status:"Emailed", _source:"Claude AI", _addedAt:Date.now()-72000000 },
     { name:"Capital City Auto Care", owner:"James Pittman", email:"james@capcityauto.com", phone:"512-555-0331", city:"Austin", state:"TX", niche:"Auto Repair", status:"Follow-Up 1", _source:"Claude AI", _addedAt:Date.now()-48000000 },
     { name:"Rocky Mountain Chiropractic", owner:"Dr. Ben Walsh", email:"ben@rmchiro.com", phone:"720-555-0198", city:"Denver", state:"CO", niche:"Chiropractors", status:"Meeting Set", _source:"Claude AI", _addedAt:Date.now()-24000000 },
-  ]);
+  ];
+  const [leads, setLeads] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_leads");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return SAMPLE_LEADS;
+  });
 
   const [scrapeNiche, setScrapeNiche] = useState("Spas");
   const [scrapeCity, setScrapeCity] = useState("Salt Lake City, UT");
@@ -287,12 +294,21 @@ export default function App() {
   const [leadFilter, setLeadFilter] = useState("All");
   const [leadSearch, setLeadSearch] = useState("");
   const [leadActions, setLeadActions] = useState({});
+  const [csvUploadErr, setCsvUploadErr] = useState("");
+  const [csvUploadInfo, setCsvUploadInfo] = useState("");
+  const csvInputRef = useRef(null);
 
-  // ── Calendar ──
-  const [calendar, setCalendar] = useState([
-    { title:"Demo – Rocky Mountain Chiropractic", date:"2026-06-08", time:"10:00 AM", with:"Dr. Ben Walsh", email:"ben@rmchiro.com", notes:"Wants to reduce missed calls after hours" },
-    { title:"Demo – Desert Bloom Spa", date:"2026-06-10", time:"2:30 PM", with:"Monica Reyes", email:"monica@desertbloomspa.com", notes:"Interested in appointment booking automation" },
-  ]);
+  // ── Calendar (persistent) ──
+  const [calendar, setCalendar] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_calendar");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return [
+      { title:"Demo – Rocky Mountain Chiropractic", date:"2026-06-08", time:"10:00 AM", with:"Dr. Ben Walsh", email:"ben@rmchiro.com", notes:"Wants to reduce missed calls after hours" },
+      { title:"Demo – Desert Bloom Spa", date:"2026-06-10", time:"2:30 PM", with:"Monica Reyes", email:"monica@desertbloomspa.com", notes:"Interested in appointment booking automation" },
+    ];
+  });
 
   // ── Email Sender Config ──
   const [fromName, setFromName] = useState(() => {
@@ -305,8 +321,21 @@ export default function App() {
   // emailConfig shim so send logic keeps working without changes
   const emailConfig = { configured: true, fromName };
 
-  // ── Email Queue & Sending ──
-  const [sendQueue, setSendQueue] = useState([]);
+  // ── Email Queue & Sending (persistent) ──
+  const [sendQueue, setSendQueue] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_send_queue");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return [];
+  });
+  const [emailLog, setEmailLog] = useState(() => {
+    try {
+      const saved = localStorage.getItem("navain_email_log");
+      if (saved) return JSON.parse(saved);
+    } catch(e) {}
+    return [];
+  });
   const [sending, setSending] = useState(false);
   const [autoFollowUp, setAutoFollowUp] = useState(false);
   const [followUpDelay, setFollowUpDelay] = useState(3);
@@ -325,6 +354,12 @@ export default function App() {
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, chatLoading]);
+
+  // ── Persist state to localStorage ──
+  useEffect(() => { try { localStorage.setItem("navain_leads", JSON.stringify(leads)); } catch(e) {} }, [leads]);
+  useEffect(() => { try { localStorage.setItem("navain_calendar", JSON.stringify(calendar)); } catch(e) {} }, [calendar]);
+  useEffect(() => { try { localStorage.setItem("navain_send_queue", JSON.stringify(sendQueue)); } catch(e) {} }, [sendQueue]);
+  useEffect(() => { try { localStorage.setItem("navain_email_log", JSON.stringify(emailLog)); } catch(e) {} }, [emailLog]);
 
   // ── Stats ──
   const totalLeads = leads.length;
@@ -346,6 +381,98 @@ export default function App() {
       setTab("Leads");
     } catch(e) { setScrapeErr(e.message); addToast("Lead generation failed: " + e.message, "error"); }
     setScraping(false); setAgentRunning(false);
+  }
+
+  // ── CSV Upload & smart column mapping ──
+  function parseCSVLine(line) {
+    const result = []; let cur = ""; let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQuotes = !inQuotes; }
+      else if (ch === "," && !inQuotes) { result.push(cur.trim()); cur = ""; }
+      else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result;
+  }
+
+  function smartMap(headers) {
+    // Maps any header variant → our internal field name
+    const rules = {
+      name:        ["business","company","business name","company name","name","store","practice","clinic","shop"],
+      owner:       ["owner","contact","person","contact name","full name","first name","fname","rep"],
+      email:       ["email","email address","e-mail","mail"],
+      phone:       ["phone","phone number","telephone","tel","mobile","cell","number"],
+      city:        ["city","town","location"],
+      state:       ["state","province","region","st"],
+      niche:       ["niche","industry","type","category","sector","vertical","business type"],
+    };
+    const map = {};
+    headers.forEach((h, i) => {
+      const lower = h.toLowerCase().trim();
+      for (const [field, variants] of Object.entries(rules)) {
+        if (!map[field] && variants.some(v => lower.includes(v))) {
+          map[field] = i;
+        }
+      }
+    });
+    return map;
+  }
+
+  function handleCSVUpload(e) {
+    setCsvUploadErr(""); setCsvUploadInfo("");
+    const file = e.target.files[0];
+    if (!file) return;
+    if (!file.name.endsWith(".csv")) { setCsvUploadErr("Please upload a .csv file."); return; }
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const lines = ev.target.result.split(/\r?\n/).filter(l => l.trim());
+        if (lines.length < 2) { setCsvUploadErr("CSV has no data rows."); return; }
+        const headers = parseCSVLine(lines[0]);
+        const map = smartMap(headers);
+
+        if (!map.email) { setCsvUploadErr(`Could not find an email column. Headers found: ${headers.join(", ")}`); return; }
+
+        const imported = [];
+        const skipped = [];
+        for (let i = 1; i < lines.length; i++) {
+          const cols = parseCSVLine(lines[i]);
+          const email = cols[map.email]?.replace(/"/g,"").trim();
+          if (!email || !email.includes("@")) { skipped.push(i + 1); continue; }
+          imported.push({
+            name:   cols[map.name]?.replace(/"/g,"").trim()  || email.split("@")[1]?.split(".")[0] || "Unknown Business",
+            owner:  cols[map.owner]?.replace(/"/g,"").trim() || "Owner",
+            email,
+            phone:  cols[map.phone]?.replace(/"/g,"").trim() || "",
+            city:   cols[map.city]?.replace(/"/g,"").trim()  || "",
+            state:  cols[map.state]?.replace(/"/g,"").trim() || "",
+            niche:  cols[map.niche]?.replace(/"/g,"").trim() || "General",
+            status: "New",
+            _source: file.name,
+            _addedAt: Date.now(),
+          });
+        }
+
+        if (imported.length === 0) { setCsvUploadErr("No valid rows found. Make sure your CSV has an email column."); return; }
+
+        setLeads(prev => {
+          const existing = new Set(prev.map(l => l.email.toLowerCase()));
+          const fresh = imported.filter(l => !existing.has(l.email.toLowerCase()));
+          const dupes = imported.length - fresh.length;
+          const msg = `✓ ${fresh.length} leads imported from ${file.name}${dupes > 0 ? ` · ${dupes} duplicates skipped` : ""}${skipped.length > 0 ? ` · ${skipped.length} rows missing email skipped` : ""}`;
+          setCsvUploadInfo(msg);
+          addToast(`${fresh.length} leads imported`);
+          return [...prev, ...fresh];
+        });
+
+        if (csvInputRef.current) csvInputRef.current.value = "";
+        setTab("Leads");
+      } catch(err) {
+        setCsvUploadErr("Failed to parse CSV: " + err.message);
+      }
+    };
+    reader.readAsText(file);
   }
 
   // ── Generate email for a lead ──
@@ -376,6 +503,7 @@ export default function App() {
   // ── Send one email via Nodemailer ──
   async function sendOne(item) {
     setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"sending" } : q));
+    const sentAt = new Date().toISOString();
     try {
       await sendViaNodemailer({
         fromName,
@@ -384,13 +512,45 @@ export default function App() {
         subject: item.subject,
         body: item.body
       });
-      setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"sent", sentAt:new Date().toLocaleTimeString() } : q));
-      setLeads(p => p.map(l => l.email === item.lead.email ? { ...l, status: item.type === "cold" ? "Emailed" : item.type === "fu1" ? "Follow-Up 1" : "Follow-Up 2" } : l));
+      const newStatus = item.type === "cold" ? "Emailed" : item.type === "fu1" ? "Follow-Up 1" : "Follow-Up 2";
+      setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"sent", sentAt } : q));
+      setLeads(p => p.map(l => l.email === item.lead.email ? {
+        ...l,
+        status: newStatus,
+        _statusHistory: [...(l._statusHistory || []), { status: newStatus, at: sentAt }]
+      } : l));
+      setEmailLog(p => [...p, {
+        id: item.id,
+        sentAt,
+        business: item.lead.name,
+        owner: item.lead.owner,
+        email: item.lead.email,
+        niche: item.lead.niche,
+        city: item.lead.city,
+        state: item.lead.state,
+        type: item.type === "cold" ? "Cold Email" : item.type === "fu1" ? "Follow-Up 1" : "Follow-Up 2",
+        subject: item.subject,
+        status: "sent"
+      }]);
       addToast(`✉ Sent to ${item.lead.name}`);
       if (autoFollowUp && item.type === "cold") scheduleFollowUp(item.lead, 1);
       if (autoFollowUp && item.type === "fu1") scheduleFollowUp(item.lead, 2);
     } catch(e) {
       setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"failed", error:e.message } : q));
+      setEmailLog(p => [...p, {
+        id: item.id,
+        sentAt,
+        business: item.lead.name,
+        owner: item.lead.owner,
+        email: item.lead.email,
+        niche: item.lead.niche,
+        city: item.lead.city,
+        state: item.lead.state,
+        type: item.type === "cold" ? "Cold Email" : item.type === "fu1" ? "Follow-Up 1" : "Follow-Up 2",
+        subject: item.subject,
+        status: "failed",
+        error: e.message
+      }]);
       addToast(`Failed: ${item.lead.name} — ${e.message}`, "error");
     }
   }
@@ -404,6 +564,51 @@ export default function App() {
       await new Promise(r => setTimeout(r, 1200));
     }
     setSending(false);
+  }
+
+  // ── Export email log as CSV ──
+  function exportEmailLogCSV() {
+    if (emailLog.length === 0) { addToast("No emails logged yet", "warn"); return; }
+    const headers = ["Sent At","Business","Owner","Email","Niche","City","State","Type","Subject","Status","Error"];
+    const rows = emailLog.map(e => [
+      e.sentAt ? new Date(e.sentAt).toLocaleString() : "",
+      e.business, e.owner, e.email, e.niche, e.city, e.state,
+      e.type, `"${(e.subject||"").replace(/"/g,'""')}"`,
+      e.status, e.error || ""
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type:"text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url;
+    a.download = `navain_email_log_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+    addToast("Email log exported ✓");
+  }
+
+  // ── Export leads as CSV ──
+  function exportLeadsCSV() {
+    if (leads.length === 0) { addToast("No leads to export", "warn"); return; }
+    const headers = ["Business","Owner","Email","Phone","City","State","Niche","Status","Source","Added At"];
+    const rows = leads.map(l => [
+      l.name, l.owner, l.email, l.phone, l.city, l.state,
+      l.niche, l.status, l._source || "Claude AI",
+      l._addedAt ? new Date(l._addedAt).toLocaleString() : ""
+    ]);
+    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type:"text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url;
+    a.download = `navain_leads_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+    addToast("Leads exported ✓");
+  }
+
+  // ── Clear all data ──
+  function clearAllData() {
+    if (!confirm("Clear all leads, queue, and email log? This cannot be undone.")) return;
+    setLeads(SAMPLE_LEADS); setCalendar([]); setSendQueue([]); setEmailLog([]);
+    ["navain_leads","navain_calendar","navain_send_queue","navain_email_log"].forEach(k => { try { localStorage.removeItem(k); } catch(e) {} });
+    addToast("All data cleared");
   }
 
   // ── Auto follow-up scheduler ──
@@ -506,7 +711,7 @@ export default function App() {
 
         <nav style={{ marginTop:24, flex:1 }}>
           {TABS.map(t => {
-            const icons = { Dashboard:"⬛", Leads:"👥", "Email Sender":"✉", Campaigns:"📊", Calendar:"📅", "Agent Chat":"🤖" };
+            const icons = { Dashboard:"⬛", Leads:"👥", "Email Sender":"✉", Campaigns:"📊", Calendar:"📅", "Email Log":"📋", "Agent Chat":"🤖" };
             const active = tab === t;
             return (
               <button key={t} onClick={() => setTab(t)} style={{ width:"100%", display:"flex", alignItems:"center", gap:10, padding:"10px 12px", borderRadius:10, background:active?"rgba(0,229,255,0.08)":"transparent", border:active?"1px solid rgba(0,229,255,0.18)":"1px solid transparent", color:active?"#00e5ff":"#64748b", fontSize:13, fontWeight:active?700:500, cursor:"pointer", fontFamily:"inherit", marginBottom:4, transition:"all 0.15s", textAlign:"left" }}>
@@ -542,7 +747,22 @@ export default function App() {
               {failedEmails > 0 && <StatCard label="Failed" value={failedEmails} icon="⚠️" color="#f87171" />}
             </div>
 
-            <Section title="🚀 Quick: Generate Leads" sub="Claude AI generates realistic USA business leads — no external database">
+            {/* ── CSV Upload ── */}
+            <Section title="📂 Import Your Leads" sub="Upload a CSV — any column format, auto-detected">
+              <div style={{ display:"flex", gap:12, alignItems:"center", flexWrap:"wrap" }}>
+                <input ref={csvInputRef} type="file" accept=".csv" onChange={handleCSVUpload} style={{ display:"none" }} id="csv-upload" />
+                <label htmlFor="csv-upload" style={{ ...pBtn(false), cursor:"pointer" }}>⬆ Upload CSV</label>
+                <div style={{ fontSize:12, color:"#475569", lineHeight:1.6 }}>
+                  Any columns work — email is required. Business name, owner, phone, city, state, niche auto-detected.<br/>
+                  Duplicates skipped automatically.
+                </div>
+              </div>
+              {csvUploadInfo && <div style={{ color:"#4ade80", fontSize:12, marginTop:10, background:"rgba(74,222,128,0.06)", border:"1px solid rgba(74,222,128,0.18)", borderRadius:8, padding:"8px 12px" }}>{csvUploadInfo}</div>}
+              {csvUploadErr && <div style={{ color:"#f87171", fontSize:12, marginTop:10, background:"rgba(248,113,113,0.08)", border:"1px solid rgba(248,113,113,0.2)", borderRadius:8, padding:"8px 12px" }}>⚠ {csvUploadErr}</div>}
+            </Section>
+
+            {/* ── AI Generate Leads (backup) ── */}
+            <Section title="🤖 AI Generate Leads" sub="Claude generates demo leads — use your own CSV for real outreach">
               <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"flex-end" }}>
                 <div style={{ flex:1, minWidth:150 }}>
                   <label style={{ fontSize:11, color:"#64748b", display:"block", marginBottom:5 }}>NICHE</label>
@@ -563,7 +783,7 @@ export default function App() {
                   </select>
                 </div>
                 <button onClick={handleScrape} disabled={scraping} style={pBtn(scraping)}>
-                  {scraping ? <><Spinner/>Generating…</> : "⚡ Generate Leads"}
+                  {scraping ? <><Spinner/>Generating…</> : "⚡ Generate"}
                 </button>
               </div>
               {scrapeErr && <div style={{ color:"#f87171", fontSize:12, marginTop:10, background:"rgba(248,113,113,0.08)", border:"1px solid rgba(248,113,113,0.2)", borderRadius:8, padding:"8px 12px" }}>⚠ {scrapeErr}</div>}
@@ -612,6 +832,9 @@ export default function App() {
                 <select value={leadFilter} onChange={e=>setLeadFilter(e.target.value)} style={{ ...sel, width:140 }}>
                   {["All","New","Emailed","Follow-Up 1","Follow-Up 2","Meeting Set","Closed","Bounced"].map(s=><option key={s}>{s}</option>)}
                 </select>
+                <button onClick={exportLeadsCSV} style={secBtn}>⬇ Export CSV</button>
+                <label htmlFor="csv-upload-leads" style={secBtn}>⬆ Import CSV</label>
+                <input id="csv-upload-leads" type="file" accept=".csv" onChange={handleCSVUpload} style={{ display:"none" }} />
               </div>
             </div>
 
@@ -644,6 +867,15 @@ export default function App() {
                       <div style={{ color:"#64748b", fontSize:12, marginTop:2 }}>{lead.owner} · {lead.phone}</div>
                       <div style={{ color:"#475569", fontSize:12 }}>{lead.city}, {lead.state} · {lead.niche}</div>
                       <div style={{ fontSize:11, color:"#334155", marginTop:2 }}>✉ {lead.email}</div>
+                      {lead._statusHistory && lead._statusHistory.length > 0 && (
+                        <div style={{ fontSize:10, color:"#475569", marginTop:4, display:"flex", gap:6, flexWrap:"wrap" }}>
+                          {lead._statusHistory.map((h,i) => (
+                            <span key={i} style={{ background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:6, padding:"2px 7px" }}>
+                              {h.status} · {new Date(h.at).toLocaleDateString()}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                     <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
                       <Badge status={lead.status} />
@@ -830,6 +1062,63 @@ export default function App() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* ════ EMAIL LOG ════ */}
+        {tab === "Email Log" && (
+          <div style={{ animation:"fadeIn 0.3s ease" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20, flexWrap:"wrap", gap:10 }}>
+              <div>
+                <h1 style={{ fontFamily:"'Sora',sans-serif", fontSize:26, fontWeight:800, color:"#f0f4ff" }}>📋 Email Log</h1>
+                <p style={{ color:"#475569", fontSize:13, marginTop:3 }}>{emailLog.length} emails recorded · persistent across sessions</p>
+              </div>
+              <div style={{ display:"flex", gap:8 }}>
+                <button onClick={exportEmailLogCSV} style={pBtn(emailLog.length === 0)} disabled={emailLog.length === 0}>⬇ Export CSV</button>
+                <button onClick={()=>{ if(!confirm("Clear email log?")) return; setEmailLog([]); try{localStorage.removeItem("navain_email_log")}catch(e){} addToast("Log cleared"); }} style={secBtn}>Clear Log</button>
+              </div>
+            </div>
+
+            {emailLog.length === 0 && (
+              <div style={{ textAlign:"center", padding:60, color:"#334155" }}>
+                <div style={{ fontSize:40, marginBottom:12 }}>📭</div>
+                <div>No emails sent yet. Send your first email from the Leads tab.</div>
+              </div>
+            )}
+
+            {emailLog.length > 0 && (
+              <div style={{ background:"rgba(255,255,255,0.02)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:16, overflow:"hidden" }}>
+                <div style={{ display:"grid", gridTemplateColumns:"160px 1fr 1fr 110px 100px 90px", gap:0, background:"rgba(255,255,255,0.04)", padding:"10px 16px", fontSize:10, color:"#475569", fontWeight:700, textTransform:"uppercase", letterSpacing:0.5 }}>
+                  <span>Sent At</span><span>Business</span><span>Subject</span><span>Type</span><span>Status</span><span>Niche</span>
+                </div>
+                {[...emailLog].reverse().map((e,i) => {
+                  const statusColor = e.status === "sent" ? "#4ade80" : "#f87171";
+                  return (
+                    <div key={e.id || i} style={{ display:"grid", gridTemplateColumns:"160px 1fr 1fr 110px 100px 90px", gap:0, padding:"11px 16px", borderTop:"1px solid rgba(255,255,255,0.04)", alignItems:"center", animation:"fadeIn 0.2s ease" }}>
+                      <span style={{ fontSize:11, color:"#475569" }}>{e.sentAt ? new Date(e.sentAt).toLocaleString([], {dateStyle:"short", timeStyle:"short"}) : "—"}</span>
+                      <div>
+                        <div style={{ fontSize:12, fontWeight:600, color:"#f0f4ff" }}>{e.business}</div>
+                        <div style={{ fontSize:11, color:"#475569" }}>{e.owner} · {e.email}</div>
+                      </div>
+                      <span style={{ fontSize:11, color:"#94a3b8", paddingRight:8, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{e.subject}</span>
+                      <span style={{ fontSize:11, color:"#64748b" }}>{e.type}</span>
+                      <div>
+                        <span style={{ fontSize:11, color:statusColor, fontWeight:700, textTransform:"uppercase" }}>{e.status}</span>
+                        {e.error && <div style={{ fontSize:10, color:"#f87171", marginTop:2 }}>{e.error}</div>}
+                      </div>
+                      <span style={{ fontSize:11, color:"#475569" }}>{e.niche}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Settings: Clear all data */}
+            <div style={{ marginTop:32, background:"rgba(239,68,68,0.04)", border:"1px solid rgba(239,68,68,0.12)", borderRadius:14, padding:20 }}>
+              <div style={{ fontWeight:700, fontSize:13, color:"#f87171", marginBottom:6 }}>⚠ Danger Zone</div>
+              <div style={{ fontSize:12, color:"#64748b", marginBottom:12 }}>Clear all leads, send queue, calendar, and email log. Cannot be undone.</div>
+              <button onClick={clearAllData} style={{ ...secBtn, color:"#f87171", borderColor:"rgba(239,68,68,0.3)" }}>Clear All Data</button>
+            </div>
           </div>
         )}
 
