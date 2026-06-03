@@ -182,7 +182,14 @@ async function sendViaEmailJS({ serviceId, templateId, publicKey, to, toName, su
     reply_to: fromName || "Navain AI"
   };
 
-  return await window.emailjs.send(serviceId, templateId, params);
+  try {
+    const result = await window.emailjs.send(serviceId, templateId, params);
+    return result;
+  } catch(err) {
+    console.error("EmailJS error:", JSON.stringify(err));
+    const msg = err?.text || err?.message || JSON.stringify(err) || "Unknown EmailJS error";
+    throw new Error(msg);
+  }
 }
 
 // ─── UI Helpers ───────────────────────────────────────────────────────────────
