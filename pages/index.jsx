@@ -109,7 +109,14 @@ RULES:
 - Mention ONE pain point relevant to their niche (missed calls, after-hours, no-show bookings)
 - NO pricing. NO Calendly. NO "I hope this email finds you well."
 - End with EXACTLY: "Just reply here and we'll find a time that works."
-- Sign off: Hunain | Navain AI
+- End the email with EXACTLY this signature, on its own line:
+
+Best, Andrew.
+Navain AI — Intelligent Voice Agents
+(209) 960-3164
+navainai.vercel.app
+revenuepartners.co@gmail.com
+
 - Output ONLY the email body. No subject. No markdown.`;
 
   return await claude({
@@ -127,7 +134,14 @@ RULES:
 - Follow-up #2: 1 sentence. Final bump. Slightly more urgent but still human.
 - NO pricing. NO Calendly.
 - End with: "Just reply and we can chat."
-- Sign off: Hunain | Navain AI
+- End the email with EXACTLY this signature, on its own line:
+
+Best, Andrew.
+Navain AI — Intelligent Voice Agents
+(209) 960-3164
+navainai.vercel.app
+revenuepartners.co@gmail.com
+
 - Output ONLY the email body. No subject. No markdown.`;
 
   return await claude({
@@ -160,23 +174,17 @@ UI note: tell users to use the dedicated buttons for lead generation and sending
   return await claude({ system, messages: [...history.filter(m => m.role !== "system"), { role:"user", content:msg }] });
 }
 
-// ─── EmailJS sender via Vercel backend (no origin restrictions) ───────────────
-async function sendViaEmailJS({ serviceId, templateId, publicKey, to, toName, subject, body, fromName }) {
+// ─── Resend sender via Vercel backend (free, no domain needed) ───────────────
+async function sendViaEmailJS({ to, toName, subject, body, fromName }) {
   const res = await fetch("/api/sendemail", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      serviceId,
-      templateId,
-      publicKey,
-      templateParams: {
-        to_email: to,
-        to_name: toName,
-        from_name: fromName || "Hunain | Navain AI",
-        subject,
-        message: body,
-        reply_to: fromName || "Navain AI"
-      }
+      toEmail: to,
+      toName,
+      subject,
+      message: body,
+      fromName: fromName || "Andrew | Navain AI"
     })
   });
   const data = await res.json();
@@ -292,15 +300,15 @@ export default function App() {
       const saved = localStorage.getItem("navain_emailjs_config");
       if (saved) return JSON.parse(saved);
     } catch(e) {}
-    return { serviceId: "", templateId: "", publicKey: "", fromName: "Hunain | Navain AI", configured: false };
+    return { serviceId: "", templateId: "", publicKey: "", fromName: "Andrew | Navain AI", configured: false };
   });
   const [showConfig, setShowConfig] = useState(false);
   const [configDraft, setConfigDraft] = useState(() => {
     try {
       const saved = localStorage.getItem("navain_emailjs_config");
-      if (saved) { const p = JSON.parse(saved); return { serviceId:p.serviceId||"", templateId:p.templateId||"", publicKey:p.publicKey||"", fromName:p.fromName||"Hunain | Navain AI" }; }
+      if (saved) { const p = JSON.parse(saved); return { serviceId:p.serviceId||"", templateId:p.templateId||"", publicKey:p.publicKey||"", fromName:p.fromName||"Andrew | Navain AI" }; }
     } catch(e) {}
-    return { serviceId:"", templateId:"", publicKey:"", fromName:"Hunain | Navain AI" };
+    return { serviceId:"", templateId:"", publicKey:"", fromName:"Andrew | Navain AI" };
   });
 
   // ── Email Queue & Sending ──
@@ -711,7 +719,7 @@ export default function App() {
                     2. Create a template with variables: <code style={{color:"#a78bfa"}}>{"{{subject}} {{message}} {{to_email}} {{to_name}} {{from_name}} {{reply_to}}"}</code><br/>
                     3. Copy your Service ID, Template ID, and Public Key below
                   </div>
-                  {[["Service ID","serviceId","service_abc123"],["Template ID","templateId","template_xyz789"],["Public Key","publicKey","your_public_key"],["From Name","fromName","Hunain | Navain AI"]].map(([label,key,ph])=>(
+                  {[["Service ID","serviceId","service_abc123"],["Template ID","templateId","template_xyz789"],["Public Key","publicKey","your_public_key"],["From Name","fromName","Andrew | Navain AI"]].map(([label,key,ph])=>(
                     <div key={key}>
                       <label style={{ fontSize:11, color:"#64748b", display:"block", marginBottom:5 }}>{label.toUpperCase()}</label>
                       <input type={key==="publicKey"?"password":"text"} placeholder={ph} value={configDraft[key]} onChange={e=>setConfigDraft(p=>({...p,[key]:e.target.value}))} style={inp} />
