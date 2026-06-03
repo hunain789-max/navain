@@ -160,36 +160,28 @@ UI note: tell users to use the dedicated buttons for lead generation and sending
   return await claude({ system, messages: [...history.filter(m => m.role !== "system"), { role:"user", content:msg }] });
 }
 
-// ─── EmailJS real sender ──────────────────────────────────────────────────────
+// ─── EmailJS sender via Vercel backend (no origin restrictions) ───────────────
 async function sendViaEmailJS({ serviceId, templateId, publicKey, to, toName, subject, body, fromName }) {
-  if (!window.emailjs) {
-    await new Promise((resolve, reject) => {
-      const s = document.createElement("script");
-      s.src = "https://cdn.jsdelivr.net/npm/@emailjs/browser@4/dist/email.min.js";
-      s.onload = resolve;
-      s.onerror = reject;
-      document.head.appendChild(s);
-    });
-  }
-  window.emailjs.init({ publicKey });
-
-  const params = {
-    to_email: to,
-    to_name: toName,
-    from_name: fromName || "Hunain | Navain AI",
-    subject,
-    message: body,
-    reply_to: fromName || "Navain AI"
-  };
-
-  try {
-    const result = await window.emailjs.send(serviceId, templateId, params);
-    return result;
-  } catch(err) {
-    console.error("EmailJS error:", JSON.stringify(err));
-    const msg = err?.text || err?.message || JSON.stringify(err) || "Unknown EmailJS error";
-    throw new Error(msg);
-  }
+  const res = await fetch("/api/sendemail", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      serviceId,
+      templateId,
+      publicKey,
+      templateParams: {
+        to_email: to,
+        to_name: toName,
+        from_name: fromName || "Hunain | Navain AI",
+        subject,
+        message: body,
+        reply_to: fromName || "Navain AI"
+      }
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data?.error || "Email send failed");
+  return data;
 }
 
 // ─── UI Helpers ───────────────────────────────────────────────────────────────
