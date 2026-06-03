@@ -192,6 +192,20 @@ async function sendViaNodemailer({ to, toName, subject, body, fromName }) {
   return data;
 }
 
+// ─── Email Verifier ───────────────────────────────────────────────────────────
+async function verifyEmail(email) {
+  try {
+    const res = await fetch("/api/verifyemail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    });
+    return await res.json(); // { valid, reason, warning? }
+  } catch {
+    return { valid: true, reason: "Verification unavailable — proceeding", warning: true };
+  }
+}
+
 // ─── UI Helpers ───────────────────────────────────────────────────────────────
 function Spinner({ size = 14, color = "#fff" }) {
   return <span style={{ display:"inline-block", width:size, height:size, border:`2px solid rgba(255,255,255,0.2)`, borderTopColor:color, borderRadius:"50%", animation:"spin 0.6s linear infinite", verticalAlign:"middle", flexShrink:0 }} />;
@@ -339,6 +353,15 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [autoFollowUp, setAutoFollowUp] = useState(false);
   const [followUpDelay, setFollowUpDelay] = useState(3);
+  // ── Email Verifier modal state ──
+  const [verifyModal, setVerifyModal] = useState(null); // { item, result } or null
+  const [verifying, setVerifying] = useState(false);
+  // ── Batch send limit ──
+  const [batchLimit, setBatchLimit] = useState(() => {
+    try { return parseInt(localStorage.getItem("navain_batch_limit") || "20", 10); } catch(e) { return 20; }
+  });
+  // ── Follow-up generation per lead ──
+  const [fuGenerating, setFuGenerating] = useState({}); // { [email]: true/false }
   const [bulkSelectNiche, setBulkSelectNiche] = useState("All");
   const [bulkGenerating, setBulkGenerating] = useState(false);
   const autoFollowTimers = useRef({});
@@ -360,6 +383,7 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("navain_calendar", JSON.stringify(calendar)); } catch(e) {} }, [calendar]);
   useEffect(() => { try { localStorage.setItem("navain_send_queue", JSON.stringify(sendQueue)); } catch(e) {} }, [sendQueue]);
   useEffect(() => { try { localStorage.setItem("navain_email_log", JSON.stringify(emailLog)); } catch(e) {} }, [emailLog]);
+  useEffect(() => { try { localStorage.setItem("navain_batch_limit", String(batchLimit)); } catch(e) {} }, [batchLimit]);
 
   // ── Stats ──
   const totalLeads = leads.length;
@@ -500,8 +524,33 @@ export default function App() {
     addToast(`${lead.name} added to send queue`);
   }
 
-  // ── Send one email via Nodemailer ──
+  // ── Send one email — verify first, then send ──
   async function sendOne(item) {
+    setVerifying(true);
+    const verifyResult = await verifyEmail(item.lead.email);
+    setVerifying(false);
+
+    if (!verifyResult.valid) {
+      // Definitely invalid — mark bounced, show modal
+      setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"failed", error:`Email invalid: ${verifyResult.reason}` } : q));
+      setLeads(p => p.map(l => l.email === item.lead.email ? { ...l, status:"Bounced" } : l));
+      addToast(`⚠ ${item.lead.name} — ${verifyResult.reason}`, "error");
+      setVerifyModal({ item, result: verifyResult, blocked: true });
+      return;
+    }
+
+    if (verifyResult.warning) {
+      // DNS soft-fail — confirm with user before sending
+      setVerifyModal({ item, result: verifyResult, blocked: false });
+      return;
+    }
+
+    await doSend(item);
+  }
+
+  // ── Actually deliver the email (post-verification) ──
+  async function doSend(item) {
+    setVerifyModal(null);
     setSendQueue(p => p.map(q => q.id === item.id ? { ...q, status:"sending" } : q));
     const sentAt = new Date().toISOString();
     try {
@@ -517,7 +566,12 @@ export default function App() {
       setLeads(p => p.map(l => l.email === item.lead.email ? {
         ...l,
         status: newStatus,
-        _statusHistory: [...(l._statusHistory || []), { status: newStatus, at: sentAt }]
+        _statusHistory: [...(l._statusHistory || []), { status: newStatus, at: sentAt }],
+        _emailHistory: [...(l._emailHistory || []), {
+          type: item.type === "cold" ? "Cold Email" : item.type === "fu1" ? "Follow-Up 1" : "Follow-Up 2",
+          subject: item.subject,
+          sentAt,
+        }]
       } : l));
       setEmailLog(p => [...p, {
         id: item.id,
@@ -555,15 +609,47 @@ export default function App() {
     }
   }
 
-  // ── Send all queued ──
+  // ── Send all queued (respects batch limit) ──
   async function sendAll() {
     setSending(true);
-    const queued = sendQueue.filter(q => q.status === "queued");
+    const queued = sendQueue.filter(q => q.status === "queued").slice(0, batchLimit);
+    if (queued.length === 0) { setSending(false); return; }
+    addToast(`Sending ${queued.length} emails (limit: ${batchLimit})`, "warn");
     for (const item of queued) {
       await sendOne(item);
       await new Promise(r => setTimeout(r, 1200));
     }
     setSending(false);
+  }
+
+  // ── Manual follow-up: generate & queue FU1 or FU2 for a lead ──
+  async function handleManualFollowUp(lead, num) {
+    const key = lead.email;
+    setFuGenerating(p => ({ ...p, [key]: num }));
+    setAgentRunning(true);
+    try {
+      const type = num === 1 ? "fu1" : "fu2";
+      // Check not already queued
+      const alreadyQueued = sendQueue.find(q => q.lead.email === lead.email && q.type === type && q.status === "queued");
+      if (alreadyQueued) { addToast(`Follow-Up ${num} already in queue for ${lead.name}`, "warn"); return; }
+      const [body, subject] = await Promise.all([agentWriteFollowUp(lead, num), agentSubject(lead, "followup")]);
+      addToQueue(lead, subject, body, type);
+      // Store follow-up in lead history
+      setLeads(p => p.map(l => l.email === lead.email ? {
+        ...l,
+        _emailHistory: [...(l._emailHistory || []), {
+          type: `Follow-Up ${num} (drafted)`,
+          subject,
+          body,
+          at: new Date().toISOString()
+        }]
+      } : l));
+      addToast(`✉ Follow-Up ${num} queued for ${lead.name}`);
+    } catch(e) {
+      addToast(`Follow-up generation failed: ${e.message}`, "error");
+    }
+    setFuGenerating(p => ({ ...p, [key]: null }));
+    setAgentRunning(false);
   }
 
   // ── Export email log as CSV ──
@@ -791,7 +877,7 @@ export default function App() {
 
             <Section title="📤 Send Queue" sub={`${sendQueue.filter(q=>q.status==="queued").length} queued · ${sentEmails} sent`}
               action={<button onClick={sendAll} disabled={sending || !sendQueue.some(q=>q.status==="queued")} style={pBtn(sending || !sendQueue.some(q=>q.status==="queued"))}>
-                {sending ? <><Spinner/>Sending…</> : "Send All →"}
+                {sending ? <><Spinner/>Sending…</> : `Send ${Math.min(batchLimit, sendQueue.filter(q=>q.status==="queued").length)} →`}
               </button>}>
               {sendQueue.length === 0 && <div style={{ color:"#334155", textAlign:"center", padding:30, fontSize:13 }}>No emails queued. Generate leads then click "Generate Email" on each lead.</div>}
               {sendQueue.slice(-10).reverse().map(item => {
@@ -810,7 +896,7 @@ export default function App() {
                       {item.error && <div style={{ fontSize:10, color:"#f87171", maxWidth:180, wordBreak:"break-all" }}>{item.error}</div>}
                     </div>
                     {item.status === "queued" && (
-                      <button onClick={()=>sendOne(item)} disabled={sending} style={microBtn("#00e5ff", !emailConfig.configured || sending)}>Send</button>
+                      <button onClick={()=>sendOne(item)} disabled={sending||verifying} style={microBtn("#00e5ff", !emailConfig.configured||sending||verifying)}>{verifying?"Checking…":"Send"}</button>
                     )}
                     {item.status === "failed" && (
                       <button onClick={()=>{setSendQueue(p=>p.map(q=>q.id===item.id?{...q,status:"queued",error:null}:q));}} style={microBtn("#f87171", false)}>Retry</button>
@@ -845,9 +931,32 @@ export default function App() {
                 {NICHES.map(n=><option key={n}>{n}</option>)}
               </select>
               <button onClick={handleBulkQueue} disabled={bulkGenerating} style={pBtn(bulkGenerating)}>
-                {bulkGenerating ? <><Spinner/>Writing emails…</> : "⚡ Bulk Generate Emails"}
+                {bulkGenerating ? <><Spinner/>Writing emails…</> : "⚡ Bulk Draft Cold"}
               </button>
-              <span style={{ color:"#334155", fontSize:12 }}>Generates cold emails for all New leads</span>
+              <button
+                onClick={async () => {
+                  setBulkGenerating(true); setAgentRunning(true);
+                  const targets = (bulkSelectNiche === "All" ? leads : leads.filter(l => l.niche === bulkSelectNiche))
+                    .filter(l => l.status === "Emailed");
+                  let count = 0;
+                  for (const lead of targets) {
+                    try {
+                      const [body, subject] = await Promise.all([agentWriteFollowUp(lead, 1), agentSubject(lead, "followup")]);
+                      addToQueue(lead, subject, body, "fu1");
+                      setLeads(p => p.map(l => l.email === lead.email ? { ...l, _emailHistory: [...(l._emailHistory||[]), { type:"Follow-Up 1 (drafted)", subject, at: new Date().toISOString() }] } : l));
+                      count++;
+                    } catch(e) {}
+                    await new Promise(r => setTimeout(r, 400));
+                  }
+                  addToast(`${count} Follow-Up 1 emails queued`);
+                  setBulkGenerating(false); setAgentRunning(false);
+                }}
+                disabled={bulkGenerating}
+                style={pBtn(bulkGenerating)}
+              >
+                {bulkGenerating ? <><Spinner/>Working…</> : "⚡ Bulk Draft FU1"}
+              </button>
+              <span style={{ color:"#334155", fontSize:12 }}>Cold = New leads · FU1 = Emailed leads</span>
             </div>
 
             {filteredLeads.length === 0 && (
@@ -889,6 +998,29 @@ export default function App() {
                           + Queue
                         </button>
                       )}
+                      {/* Manual follow-up buttons — show once lead has been emailed */}
+                      {["Emailed","Follow-Up 1","Follow-Up 2"].includes(lead.status) && (
+                        <>
+                          {lead.status === "Emailed" && (
+                            <button
+                              onClick={()=>handleManualFollowUp(lead, 1)}
+                              disabled={!!fuGenerating[lead.email]}
+                              style={microBtn("#8b5cf6", !!fuGenerating[lead.email])}
+                            >
+                              {fuGenerating[lead.email] === 1 ? <Spinner size={11}/> : "FU 1"}
+                            </button>
+                          )}
+                          {(lead.status === "Follow-Up 1") && (
+                            <button
+                              onClick={()=>handleManualFollowUp(lead, 2)}
+                              disabled={!!fuGenerating[lead.email]}
+                              style={microBtn("#ec4899", !!fuGenerating[lead.email])}
+                            >
+                              {fuGenerating[lead.email] === 2 ? <Spinner size={11}/> : "FU 2"}
+                            </button>
+                          )}
+                        </>
+                      )}
                       {lead.status !== "Meeting Set" && (
                         <button onClick={()=>handleSchedule(lead)} disabled={action.scheduling} style={microBtn("#f59e0b", action.scheduling)}>
                           {action.scheduling ? <Spinner size={11}/> : "📅 Schedule"}
@@ -904,6 +1036,24 @@ export default function App() {
                     <div style={{ marginTop:14, background:"rgba(0,229,255,0.04)", border:"1px solid rgba(0,229,255,0.12)", borderRadius:10, padding:14 }}>
                       <div style={{ fontSize:11, color:"#00e5ff", fontWeight:700, marginBottom:6 }}>✉ DRAFT · Subject: {action.subject}</div>
                       <div style={{ fontSize:12, color:"#94a3b8", lineHeight:1.7, whiteSpace:"pre-wrap" }}>{action.body}</div>
+                    </div>
+                  )}
+
+                  {/* Email history for this lead */}
+                  {lead._emailHistory && lead._emailHistory.length > 0 && (
+                    <div style={{ marginTop:12, borderTop:"1px solid rgba(255,255,255,0.05)", paddingTop:10 }}>
+                      <div style={{ fontSize:10, color:"#475569", fontWeight:700, textTransform:"uppercase", letterSpacing:0.5, marginBottom:6 }}>Email History</div>
+                      <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+                        {lead._emailHistory.map((h, i) => (
+                          <div key={i} style={{ display:"flex", alignItems:"center", gap:10, fontSize:11, color:"#64748b" }}>
+                            <span style={{ width:6, height:6, borderRadius:"50%", background: h.type.includes("Cold") ? "#00e5ff" : h.type.includes("1") ? "#8b5cf6" : "#ec4899", flexShrink:0 }} />
+                            <span style={{ fontWeight:600, color:"#94a3b8" }}>{h.type}</span>
+                            <span style={{ color:"#475569" }}>·</span>
+                            <span style={{ flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{h.subject}</span>
+                            <span style={{ flexShrink:0 }}>{h.sentAt ? new Date(h.sentAt).toLocaleDateString() : "drafted"}</span>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -972,9 +1122,22 @@ export default function App() {
 
             {/* Send Queue */}
             <Section title="📤 Send Queue" sub={`${sendQueue.filter(q=>q.status==="queued").length} queued · ${sentEmails} sent · ${failedEmails} failed`}
-              action={<button onClick={sendAll} disabled={sending||!sendQueue.some(q=>q.status==="queued")} style={pBtn(sending||!sendQueue.some(q=>q.status==="queued"))}>
-                {sending?<><Spinner/>Sending…</>:"Send All →"}
-              </button>}>
+              action={
+                <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6, background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.1)", borderRadius:8, padding:"4px 10px" }}>
+                    <span style={{ fontSize:11, color:"#64748b", whiteSpace:"nowrap" }}>Batch limit:</span>
+                    <input
+                      type="number" min="1" max="500"
+                      value={batchLimit}
+                      onChange={e => setBatchLimit(Math.max(1, Math.min(500, parseInt(e.target.value)||1)))}
+                      style={{ width:52, background:"transparent", border:"none", color:"#00e5ff", fontSize:13, fontWeight:700, outline:"none", fontFamily:"inherit", textAlign:"center" }}
+                    />
+                  </div>
+                  <button onClick={sendAll} disabled={sending||!sendQueue.some(q=>q.status==="queued")} style={pBtn(sending||!sendQueue.some(q=>q.status==="queued"))}>
+                    {sending?<><Spinner/>Sending…</>:`Send ${Math.min(batchLimit, sendQueue.filter(q=>q.status==="queued").length)} →`}
+                  </button>
+                </div>
+              }>
               {sendQueue.length === 0 && <div style={{ color:"#334155", textAlign:"center", padding:30, fontSize:13 }}>No emails in queue. Go to Leads and click "Draft Email" then "+ Queue".</div>}
               {sendQueue.map(item => {
                 const statusColor = item.status==="sent"?"#4ade80":item.status==="failed"?"#f87171":item.status==="sending"?"#fbbf24":"#64748b";
@@ -992,7 +1155,7 @@ export default function App() {
                       {item.error && <div style={{ fontSize:10, color:"#f87171", maxWidth:180, wordBreak:"break-all" }}>{item.error}</div>}
                     </div>
                     {item.status==="queued" && (
-                      <button onClick={()=>sendOne(item)} disabled={sending} style={microBtn("#00e5ff",!emailConfig.configured||sending)}>Send</button>
+                      <button onClick={()=>sendOne(item)} disabled={sending||verifying} style={microBtn("#00e5ff",!emailConfig.configured||sending||verifying)}>{verifying?"Checking…":"Send"}</button>
                     )}
                     {item.status==="failed" && (
                       <button onClick={()=>setSendQueue(p=>p.map(q=>q.id===item.id?{...q,status:"queued",error:null}:q))} style={microBtn("#f87171",false)}>Retry</button>
@@ -1154,6 +1317,71 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* ── Email Verification Modal ── */}
+      {verifyModal && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", zIndex:10000, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+          <div style={{ background:"#0f1729", border:`1px solid ${verifyModal.blocked ? "#ef4444" : "#f59e0b"}40`, borderRadius:18, padding:28, maxWidth:420, width:"100%", boxShadow:"0 24px 80px rgba(0,0,0,0.8)" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:16 }}>
+              <span style={{ fontSize:26 }}>{verifyModal.blocked ? "🚫" : "⚠️"}</span>
+              <div>
+                <div style={{ fontWeight:800, fontSize:15, color:"#f0f4ff" }}>
+                  {verifyModal.blocked ? "Email Verification Failed" : "Email Verification Warning"}
+                </div>
+                <div style={{ fontSize:12, color:"#7c8aaa", marginTop:2 }}>
+                  {verifyModal.item.lead.name}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ background:"rgba(255,255,255,0.04)", borderRadius:10, padding:"12px 14px", marginBottom:16 }}>
+              <div style={{ fontSize:12, color:"#94a3b8", marginBottom:4 }}>Checking address:</div>
+              <div style={{ fontSize:13, fontWeight:600, color:"#e2e8f0", wordBreak:"break-all" }}>
+                {verifyModal.item.lead.email}
+              </div>
+            </div>
+
+            <div style={{ fontSize:13, color: verifyModal.blocked ? "#fca5a5" : "#fde68a", marginBottom:20, lineHeight:1.5 }}>
+              {verifyModal.result.reason}
+            </div>
+
+            {verifyModal.blocked ? (
+              <div style={{ display:"flex", gap:10 }}>
+                <button
+                  onClick={() => setVerifyModal(null)}
+                  style={{ flex:1, background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", color:"#e2e8f0", borderRadius:10, padding:"10px 0", fontWeight:700, fontSize:13, cursor:"pointer" }}
+                >
+                  Dismiss
+                </button>
+                <button
+                  onClick={() => {
+                    setLeads(p => p.map(l => l.email === verifyModal.item.lead.email ? { ...l, status:"Bounced" } : l));
+                    setVerifyModal(null);
+                  }}
+                  style={{ flex:1, background:"rgba(239,68,68,0.15)", border:"1px solid #ef444440", color:"#fca5a5", borderRadius:10, padding:"10px 0", fontWeight:700, fontSize:13, cursor:"pointer" }}
+                >
+                  Mark as Bounced
+                </button>
+              </div>
+            ) : (
+              <div style={{ display:"flex", gap:10 }}>
+                <button
+                  onClick={() => setVerifyModal(null)}
+                  style={{ flex:1, background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", color:"#e2e8f0", borderRadius:10, padding:"10px 0", fontWeight:700, fontSize:13, cursor:"pointer" }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => doSend(verifyModal.item)}
+                  style={{ flex:1, background:"linear-gradient(135deg,#f59e0b,#d97706)", border:"none", color:"#fff", borderRadius:10, padding:"10px 0", fontWeight:700, fontSize:13, cursor:"pointer" }}
+                >
+                  Send Anyway
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Toasts */}
       <div style={{ position:"fixed", bottom:24, right:24, display:"flex", flexDirection:"column", gap:10, zIndex:9999 }}>
